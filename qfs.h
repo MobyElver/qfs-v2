@@ -30,16 +30,20 @@
 /* ------------------------------------------------------------------ */
 
 #define QFS_MAGIC          0x51      /* fs_type of every QFS image ('Q') */
-#define QFS_VERSION        1         /* value mkfs writes to version     */
+#define QFS_VERSION        2         /* value mkfs writes to version     */
 
 #define QFS_DIR_OFFSET     32        /* the directory follows superblock */
 #define QFS_NUM_ENTRIES    255       /* entries in the directory table   */
-#define QFS_DATA_OFFSET    8192      /* block 0 starts here              */
+//#define QFS_DATA_OFFSET    8192      /* block 0 starts here              */
+#define QFS_FAT_OFFSET     8192      /* for QFS-T - FAT begins here      */
+#define QS_FAT_RESERVED    0xFFFE    /* for QFS-T - FAT entry 0 value    */
+
+#define BLOCK_SIZE         2         /* number of bytes per block in FAT */
 
 #define QFS_MAX_IMAGE      125829120L /* 120 MiB: largest legal image    */
 
-#define QFS_BLOCK_FREE     0         /* flag byte of a free block        */
-#define QFS_BLOCK_BUSY     1         /* flag byte of a block in use      */
+// #define QFS_BLOCK_FREE     0         /* flag byte of a free block        */
+// #define QFS_BLOCK_BUSY     1         /* flag byte of a block in use      */
 #define QFS_END_OF_CHAIN   0xFFFF    /* next-block value of a last block */
                                      /* and starting block of empty file */
 
@@ -68,15 +72,16 @@
 #pragma pack(push, 1)
 
 typedef struct {
-    uint8_t  fs_type;              /* magic number: 0x51 ('Q')            */
-    uint16_t total_blocks;         /* number of data blocks               */
-    uint16_t available_blocks;     /* number of free data blocks          */
-    uint16_t bytes_per_block;      /* 512, 1024, or 2048                  */
-    uint8_t  total_direntries;     /* always 255                          */
-    uint8_t  available_direntries; /* number of free directory entries    */
-    uint8_t  version;              /* format version: 1 (0 also means 1)  */
-    uint8_t  reserved[7];          /* all 0                               */
-    char     label[15];            /* volume label, NUL-terminated        */
+    uint8_t  fs_type;              /* magic number: 0x51 ('Q')                      */
+    uint16_t total_blocks;         /* number of data blocks                         */
+    uint16_t available_blocks;     /* number of free data blocks                    */
+    uint16_t bytes_per_block;      /* 512, 1024, or 2048                            */
+    uint8_t  total_direntries;     /* always 255                                    */
+    uint8_t  available_direntries; /* number of free directory entries              */
+    uint8_t  version;              /* format version: 1 (0 also means 1)            */
+    uint16_t fatblocks;            /* F: size of the FAT in blocks                  */
+    uint8_t  reserved[5];          /* all 0, for QFST 2 bytes moved to FAT_BLOCKS   */
+    char     label[15];            /* volume label, NUL-terminated                  */
 } qfs_superblock;
 
 typedef struct {
@@ -109,10 +114,10 @@ _Static_assert(sizeof(qfs_direntry) == 32, "directory entry must be 32 bytes");
 /* ------------------------------------------------------------------ */
 
 /* Byte offset in the image where block b starts. */
-static inline long qfs_block_offset(const qfs_superblock *sb, uint16_t b)
-{
-    return QFS_DATA_OFFSET + (long)b * sb->bytes_per_block;
-}
+// static inline long qfs_block_offset(const qfs_superblock *super_block, uint16_t block_b)
+// {
+//     return QFS_DATA_OFFSET + (long)block_b * super_block->bytes_per_block;
+// }
 
 /* Byte offset in the image of directory entry i (0 <= i < 255). */
 static inline long qfs_entry_offset(int i)
@@ -121,9 +126,9 @@ static inline long qfs_entry_offset(int i)
 }
 
 /* How many bytes of file data one block holds: B - 3. */
-static inline uint32_t qfs_data_per_block(const qfs_superblock *sb)
+static inline uint32_t qfs_data_per_block(const qfs_superblock *super_block)
 {
-    return (uint32_t)sb->bytes_per_block - 3;
+    return (uint32_t)super_block->bytes_per_block - 3;
 }
 
 /*
@@ -131,58 +136,43 @@ static inline uint32_t qfs_data_per_block(const qfs_superblock *sb)
 ** up. Adding (per - 1) before dividing is the usual integer trick for
 ** rounding up. An empty file needs no blocks.
 */
-static inline uint32_t qfs_blocks_needed(const qfs_superblock *sb,
+static inline uint32_t qfs_blocks_needed(const qfs_superblock *super_block,
                                          uint32_t size)
 {
-    uint32_t per = qfs_data_per_block(sb);
+    uint32_t per = qfs_data_per_block(super_block);
     return (size + per - 1) / per;
 }
 
-/*
-** Get and set a block's next-block field. The two bytes are combined by
-** hand, low byte first, so the code says exactly what the specification
-** says ("little-endian") and works on any machine.
-*/
-static inline uint16_t qfs_get_next(const uint8_t *buf, uint16_t B)
-{
-    return (uint16_t)(buf[B - 2] | (buf[B - 1] << 8));
-}
-
-static inline void qfs_set_next(uint8_t *buf, uint16_t B, uint16_t next)
-{
-    buf[B - 2] = next & 0xFF;          /* low byte first  */
-    buf[B - 1] = (next >> 8) & 0xFF;   /* then high byte  */
-}
 
 /*
 ** Read the superblock from an open image and check that it is a QFS
 ** version 1 image. Prints a message and returns -1 if it isn't.
 */
-static inline int qfs_read_superblock(FILE *fp, qfs_superblock *sb)
+static inline int qfs_read_superblock(FILE *file_pointer, qfs_superblock *super_block)
 {
-    if (fseek(fp, 0, SEEK_SET) != 0 ||
-        fread(sb, sizeof(*sb), 1, fp) != 1) {
+    if (fseek(file_pointer, 0, SEEK_SET) != 0 ||
+        fread(super_block, sizeof(*super_block), 1, file_pointer) != 1) {
         fprintf(stderr, "Error: can't read the superblock\n");
         return -1;
     }
-    if (sb->fs_type != QFS_MAGIC) {
+    if (super_block->fs_type != QFS_MAGIC) {
         fprintf(stderr, "Error: not a QFS image (fs_type is 0x%02X)\n",
-                sb->fs_type);
+                super_block->fs_type);
         return -1;
     }
-    if (sb->version > QFS_VERSION) {
+    if (super_block->version > QFS_VERSION) {
         fprintf(stderr, "Error: QFS version %u is not supported\n",
-                sb->version);
+                super_block->version);
         return -1;
     }
     return 0;
 }
 
 /* Write the superblock back to the start of the image. */
-static inline int qfs_write_superblock(FILE *fp, const qfs_superblock *sb)
+static inline int qfs_write_superblock(FILE *file_pointer, const qfs_superblock *super_block)
 {
-    if (fseek(fp, 0, SEEK_SET) != 0 ||
-        fwrite(sb, sizeof(*sb), 1, fp) != 1) {
+    if (fseek(file_pointer, 0, SEEK_SET) != 0 ||
+        fwrite(super_block, sizeof(*super_block), 1, file_pointer) != 1) {
         fprintf(stderr, "Error: can't write the superblock\n");
         return -1;
     }
@@ -190,10 +180,10 @@ static inline int qfs_write_superblock(FILE *fp, const qfs_superblock *sb)
 }
 
 /* Read directory entry i into *e. */
-static inline int qfs_read_entry(FILE *fp, int i, qfs_direntry *e)
+static inline int qfs_read_entry(FILE *file_pointer, int i, qfs_direntry *e)
 {
-    if (fseek(fp, qfs_entry_offset(i), SEEK_SET) != 0 ||
-        fread(e, sizeof(*e), 1, fp) != 1) {
+    if (fseek(file_pointer, qfs_entry_offset(i), SEEK_SET) != 0 ||
+        fread(e, sizeof(*e), 1, file_pointer) != 1) {
         fprintf(stderr, "Error: can't read directory entry %d\n", i);
         return -1;
     }
@@ -201,10 +191,10 @@ static inline int qfs_read_entry(FILE *fp, int i, qfs_direntry *e)
 }
 
 /* Write *e to directory entry i. */
-static inline int qfs_write_entry(FILE *fp, int i, const qfs_direntry *e)
+static inline int qfs_write_entry(FILE *file_pointer, int i, const qfs_direntry *e)
 {
-    if (fseek(fp, qfs_entry_offset(i), SEEK_SET) != 0 ||
-        fwrite(e, sizeof(*e), 1, fp) != 1) {
+    if (fseek(file_pointer, qfs_entry_offset(i), SEEK_SET) != 0 ||
+        fwrite(e, sizeof(*e), 1, file_pointer) != 1) {
         fprintf(stderr, "Error: can't write directory entry %d\n", i);
         return -1;
     }
@@ -218,10 +208,10 @@ static inline int qfs_write_entry(FILE *fp, int i, const qfs_direntry *e)
 ** match a real name. All 255 entries are checked, because a deleted
 ** file leaves a free entry in the middle of the table.
 */
-static inline int qfs_find_file(FILE *fp, const char *name, qfs_direntry *e)
+static inline int qfs_find_file(FILE *file_pointer, const char *name, qfs_direntry *e)
 {
     for (int i = 0; i < QFS_NUM_ENTRIES; i++) {
-        if (qfs_read_entry(fp, i, e) != 0)
+        if (qfs_read_entry(file_pointer, i, e) != 0)
             return -1;
         /*
         ** filename is 23 bytes and should end in a NUL, but strncmp with
@@ -240,44 +230,44 @@ static inline int qfs_find_file(FILE *fp, const char *name, qfs_direntry *e)
 ** bytes). Fails if b isn't a real block, which also catches a damaged
 ** next-block pointer.
 */
-static inline int qfs_read_block(FILE *fp, const qfs_superblock *sb,
-                                 uint16_t b, uint8_t *buf)
+static inline int qfs_read_block(FILE *file_pointer, const qfs_superblock *super_block,
+                                 uint16_t block_b, uint8_t *buf)
 {
-    if (b >= sb->total_blocks) {
+    if (block_b >= super_block->total_blocks) {
         fprintf(stderr, "Error: block %u is past the last block (%u)\n",
-                b, sb->total_blocks - 1);
+                block_b, super_block->total_blocks - 1);
         return -1;
     }
-    if (fseek(fp, qfs_block_offset(sb, b), SEEK_SET) != 0 ||
-        fread(buf, 1, sb->bytes_per_block, fp) != sb->bytes_per_block) {
-        fprintf(stderr, "Error: can't read block %u\n", b);
+    if (fseek(file_pointer, qfs_block_offset(super_block, block_b), SEEK_SET) != 0 ||
+        fread(buf, 1, super_block->bytes_per_block, file_pointer) != super_block->bytes_per_block) {
+        fprintf(stderr, "Error: can't read block %u\n", block_b);
         return -1;
     }
     return 0;
 }
 
 /* Write all B bytes of buf to block b. */
-static inline int qfs_write_block(FILE *fp, const qfs_superblock *sb,
-                                  uint16_t b, const uint8_t *buf)
+static inline int qfs_write_block(FILE *file_pointer, const qfs_superblock *super_block,
+                                  uint16_t block_b, const uint8_t *buf)
 {
-    if (b >= sb->total_blocks) {
-        fprintf(stderr, "Error: block %u is past the last block\n", b);
+    if (block_b >= super_block->total_blocks) {
+        fprintf(stderr, "Error: block %u is past the last block\n", block_b);
         return -1;
     }
-    if (fseek(fp, qfs_block_offset(sb, b), SEEK_SET) != 0 ||
-        fwrite(buf, 1, sb->bytes_per_block, fp) != sb->bytes_per_block) {
-        fprintf(stderr, "Error: can't write block %u\n", b);
+    if (fseek(file_pointer, qfs_block_offset(super_block, block_b), SEEK_SET) != 0 ||
+        fwrite(buf, 1, super_block->bytes_per_block, file_pointer) != super_block->bytes_per_block) {
+        fprintf(stderr, "Error: can't write block %u\n", block_b);
         return -1;
     }
     return 0;
 }
 
 /* Write a single flag byte (QFS_BLOCK_BUSY or QFS_BLOCK_FREE) to block b. */
-static inline int qfs_set_flag(FILE *fp, const qfs_superblock *sb,
+static inline int qfs_set_flag(FILE *file_pointer, const qfs_superblock *super_block,
                                uint16_t b, uint8_t flag)
 {
-    if (fseek(fp, qfs_block_offset(sb, b), SEEK_SET) != 0 ||
-        fwrite(&flag, 1, 1, fp) != 1) {
+    if (fseek(file_pointer, qfs_block_offset(super_block, b), SEEK_SET) != 0 ||
+        fwrite(&flag, 1, 1, file_pointer) != 1) {
         fprintf(stderr, "Error: can't write the flag of block %u\n", b);
         return -1;
     }
